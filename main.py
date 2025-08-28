@@ -1,0 +1,1647 @@
+# -*- coding: utf-8 -*-
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import html
+import re
+import time
+from aiogram.types import InputMediaPhoto
+from aiogram.enums import ParseMode
+
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Tuple
+from db import (
+    get_user, add_user, update_user_lang, get_all_users,
+    add_category, get_categories, find_category, delete_category,
+    add_script, get_scripts, find_script, delete_script
+)
+from scriptblox_api import api_trending, api_search, format_script_caption, extract_image_url
+
+
+import aiohttp
+
+from aiogram.types import BotCommand
+from asyncio import Semaphore
+from aiogram import Bot, Dispatcher, F
+from aiogram.enums import ParseMode
+from aiogram.filters import StateFilter
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from urllib.parse import urlparse
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    Message,
+    InputMediaPhoto,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.client.default import DefaultBotProperties
+
+# ========================= CONFIG =========================
+
+
+TOKEN = 
+ADMIN_IDS = 
+BOT_USERNAME = 
+
+DATA_DIR = "data"
+USERS_FILE = os.path.join(DATA_DIR, "users.json")
+CATALOG_FILE = os.path.join(DATA_DIR, "catalog.json")
+
+# Единственный канал для проверки подписки
+CHANNELS = []
+
+# Показать debug-кнопку «Пропустить подписки» (уберите перед релизом)
+DEBUG_SKIP_SUBS = True
+
+# Антиспам на перелистывание карточек (сек)
+SWIPE_COOLDOWN = 10
+
+# ========================= КАРТИНКИ =========================
+IMAGES = {
+    "bypass": "https://i.postimg.cc/65M9DZzx/bypass.png",       # Начать байпасс ссылок
+    "catalog": "https://i.postimg.cc/bwnBQcZV/catalog.png",     # Каталог
+    "loading": "https://i.postimg.cc/rpLYjnWV/loading.png",     # Экран "Загрузка скриптов"
+    "menu": "https://i.postimg.cc/T1PsmKbn/menu.png",           # Главное меню
+    "profile": "https://i.postimg.cc/4Nq07Nxh/profile.png",     # Профиль
+    "scripts": "https://i.postimg.cc/q7LQLk4w/scriptss.png",    # Меню скриптов в категории
+    "subscription": "https://i.postimg.cc/269ws2qB/subs.png",   # Проверка подписки
+    "trends": "https://i.postimg.cc/rsdJMxWZ/trends.png",       # Тренды
+    "search": "https://i.postimg.cc/pVwkbSDw/Search.jpg",       # search
+    "settings": "https://i.postimg.cc/7h2VJ1yt/settings.jpg",   # settings
+    "bypassed": "https://i.postimg.cc/7b8VKRny/bypassed.png"    # bypassed
+}
+
+
+# ========================= ДЕФОЛТ КОМАНДЫ ИЗ МЕНЮ =========================
+
+async def set_commands(bot: Bot):
+    commands = [
+        BotCommand(command="start", description="⚡ Запустить Бота"),
+        BotCommand(command="menu", description="💎 Открыть Меню"),
+        BotCommand(command="catalog", description="🌐 Открыть Каталог")
+    ]
+    await bot.set_my_commands(commands)
+
+
+
+# ========================= КЭШ ТРЕНДОВ =========================
+
+TREND_CACHE = {"data": None, "time": None}
+TREND_TTL = 600  # 10 минут
+
+async def get_trends_cached():
+    now = datetime.now(timezone.utc)
+    if TREND_CACHE["data"] and TREND_CACHE["time"] and (now - TREND_CACHE["time"]).total_seconds() < TREND_TTL:
+        return TREND_CACHE["data"]
+
+    items = await api_trending()
+    if items:
+        TREND_CACHE["data"] = items
+        TREND_CACHE["time"] = now
+    return items
+
+
+
+# ========================= ЛОКАЛИ =========================
+RU = {
+    "welcome_title": "👋 Добро пожаловать в ExodusRBX_bot 🚀",
+    "menu_start_bypass": "🪄 Начать байпасс ссылок",
+    "menu_catalog": "🗂 Каталог скриптов",
+    "menu_search": "🔍 Поиск скриптов",
+    "menu_services": "⚡ Актуальные Инжекторы",
+    "menu_settings": "⚙️ Настройки",
+    "menu_profile": "👤 Профиль",
+    "back": "⬅️ Назад",
+    "choose_category": "🗂 Выберите категорию:",
+    "scripts_in_cat": "📜 Скрипты в категории «{name}»:",
+    "share": "🔗 Поделиться",
+    "subscription_required": "🚀 Больше не нужно тратить время на лишние клики — обходите ссылки в пару секунд.\n\n🗂 Все нужные скрипты собраны в одном месте — посмотрите наш <b>Каталог</b>.\n\n🔍 Нет нужного плейса? — по кнопке <b>Поиск</b> мы найдём лучшие скрипты на ваш вкус!\n\n⚡ Начните прямо сейчас: выберите действие в меню ниже.",
+    "sub_check_title": "📢<b> Подпишитесь на каналы, чтобы получить доступ к:</b>\n\n🚀 <b>Быстрому и удобному обходу ссылок</b> без ограничений\n\n🗂 <b>Полному каталогу</b> скриптов в одном месте\n\n🔍 <b>Расширенному поиску</b> скриптов под любой плейс\n\n После подписки нажмите ✅ <b>«Проверить подписку»</b> и используйте бота на полную!",
+
+    "check_sub": "✅ Проверить подписку",
+    "skip_debug": "🔧 Пропустить (debug)",
+    "sub_ok": "🎉 Спасибо! Подписка подтверждена.",
+    "lang": "🌐 Язык",
+    "lang_ru": "🇷🇺 Русский",
+    "lang_en": "🇺🇸 English",
+    "change_lang": "❓ Выберите язык бота:",
+    "settings_title": "⚙️ Настройки",
+    "no_items": "❌ Пока ничего нет.",
+    "script_added": "✅ Скрипт добавлен.",
+    "category_added": "🗂 Категория добавлена.",
+    "deleted": "🗑️ Удалено.",
+    "are_you_sure_delete_cat": "⚠️ Точно удалить категорию «{name}»?",
+    "are_you_sure_delete_script": "⚠️ Точно удалить скрипт «{name}»?",
+    "stats_title": "📊 Статистика пользователей",
+    "stats_total": "👥 Всего пользователей: {n}",
+    "stats_today": "📅 За сегодня: {n}",
+    "stats_week": "📆 За 7 дней: {n}",
+    # Search submenu
+    "search_menu_title": "🔍 Поиск скриптов",
+    "search_btn_new": " 🔍 Новый поиск",
+    "search_btn_trends": "🌟 Тренды",
+    "search_enter_mode": "🎮 Какие скрипты вы хотите увидеть?",
+    "search_mode_any": "✨ Любые",
+    "search_mode_free": "💎 Бесплатные",
+    "search_mode_paid": "💰 Платные",
+    "search_enter_query": "⌨️ Введите название игры/режима (например: \"Grow a Garden\"):",
+    "search_no_results": "❌ Ничего не найдено по запросу «{q}». Попробуйте другой запрос.",
+    "search_loading": "⏳ Ищу лучшие скрипты для Вас...",
+    "search_back": "⬅️ Назад",
+    # Trends
+    "trends_title": "🌟 Тренды ScriptBlox (топ 10)",
+    "trends_back": "⬅️ Назад",
+    # Swipe
+    "swipe_on_cooldown": "⏳ Пожалуйста, подождите {sec} сек перед следующей навигацией.",
+}
+
+
+EN = {
+    "welcome_title": "🎉 Welcome to ExodusRBX_Bot!",
+    "menu_start_bypass": "🔗 Start bypassing links",
+    "menu_catalog": "📜 Scripts catalog",
+    "menu_search": "🔍 Search scripts",
+    "menu_services": "🛠️ Injectors",
+    "menu_settings": "⚙️ Settings",
+    "menu_profile": "👤 Profile",
+    "back": "⬅️ Back",
+    "choose_category": "🗂️ Choose a category:",
+    "scripts_in_cat": "📄 Scripts in '{name}':",
+    "share": "📤 Share",
+    "subscription_required": "✨ Please subscribe to the channels below and press \"Check subscription\".",
+    "sub_check_title": "✨ Please subscribe to the channels below and press \"Check subscription\".",
+    "check_sub": "✅ Check subscription",
+    "skip_debug": "🔧 Skip (debug)",
+    "sub_ok": "🙌 Thanks! Subscription confirmed.",
+    "lang": "🌐 Language",
+    "lang_ru": "🇷🇺 Русский",
+    "lang_en": "🇬🇧 English",
+    "change_lang": "🗣️ Choose language:",
+    "settings_title": "⚙️ Settings",
+    "no_items": "😅 Nothing here yet.",
+    "script_added": "➕ Script added.",
+    "category_added": "➕ Category added.",
+    "deleted": "🗑️ Deleted.",
+    "are_you_sure_delete_cat": "❌ Delete category \"{name}\"?",
+    "are_you_sure_delete_script": "❌ Delete script \"{name}\"?",
+    "stats_title": "📊 User statistics",
+    "stats_total": "👥 Total users: {n}",
+    "stats_today": "📅 Today: {n}",
+    "stats_week": "📆 Last 7 days: {n}",
+    "search_menu_title": "🔎 Search scripts",
+    "search_btn_new": "🔍 New search",
+    "search_btn_trends": "🌟 Trends",
+    "search_enter_mode": "⚡ What kind of mode? Choose below or skip.",
+    "search_mode_any": "🎲 Any",
+    "search_mode_free": "💸 Free",
+    "search_mode_paid": "💰 Paid",
+    "search_enter_query": "🎮 Enter game/mode name (e.g. \"Grow a Garden\"):",
+    "search_no_results": "😕 No results for “{q}”. Try another query.",
+    "search_loading": "⏳ Searching...",
+    "search_back": "⬅️ Back",
+    "trends_title": "🔥 Trending ScriptBlox (top 10)",
+    "trends_back": "⬅️ Back",
+    "swipe_on_cooldown": "⏱️ Please wait {sec} sec before next.",
+}
+
+
+LOCALES = {"ru": RU, "en": EN}
+DEFAULT_LANG = "ru"
+
+# ========================= МОДЕЛИ ДАННЫХ =========================
+@dataclass
+class Script:
+    id: int
+    name: str
+    description: str
+
+@dataclass
+class Category:
+    id: int
+    name: str
+    scripts: List[Script]
+
+# ========================= УТИЛИТЫ ХРАНИЛИЩА =========================
+
+
+# ========================= ВСПОМОГАТЕЛЬНОЕ UI =========================
+
+def t(user_id: int, key: str, **fmt) -> str:
+    user = get_user(user_id)
+    lang = user["lang"] if user else DEFAULT_LANG   # 0=id, 1=lang, 2=joined
+    return LOCALES.get(lang, RU)[key].format(**fmt)
+
+
+def menu_keyboard(user_id: int) -> InlineKeyboardMarkup:
+    user = get_user(user_id)
+    lang = user["lang"] if user else DEFAULT_LANG  # 0=id, 1=lang, 2=joined
+    L = LOCALES.get(lang, RU)
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=L["menu_start_bypass"], callback_data="menu:bypass")
+    kb.button(text=L["menu_catalog"], callback_data="menu:catalog")
+    kb.button(text=L["menu_search"], callback_data="menu:search")
+    kb.button(text=L["menu_services"], callback_data="menu:services")
+    kb.button(text=L["menu_settings"], callback_data="menu:settings")
+    kb.button(text=L["menu_profile"], callback_data="menu:profile")
+
+    kb.adjust(1, 2, 2, 1)
+    return kb.as_markup()
+
+def back_kb(user_id: int, where: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t(user_id, "back"), callback_data=where)]])
+
+def categories_keyboard(user_id: int, cats: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for c in cats:
+        kb.button(text=c["name"], callback_data=f"cat:{c['id']}")
+    kb.button(text=t(user_id, "back"), callback_data="menu:root")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def scripts_keyboard(user_id: int, cat: dict, scripts: list[dict]) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    for s in scripts:
+        kb.button(text=s["name"], callback_data=f"script:{cat['id']}:{s['id']}")
+    kb.button(text=t(user_id, "back"), callback_data="catalog:root")
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+def script_card_kb(user_id: int, cat_id: int, script_id: int) -> InlineKeyboardMarkup:
+    deep = f"https://t.me/{BOT_USERNAME}?start=idc{cat_id}ids{script_id}"
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(user_id, "share"), url=deep)
+    kb.button(text=t(user_id, "back"), callback_data=f"cat:{cat_id}")
+    kb.adjust(2)
+    return kb.as_markup()
+
+# ========================= ПРОВЕРКА ПОДПИСКИ (один канал) =========================
+
+# ========================= ПРОВЕРКА ПОДПИСОК =========================
+
+async def check_subscription(user_id: int, bot: Bot, channel_id: int) -> bool:
+    if not CHANNELS:  # если список пустой — всегда "подписан"
+        return True
+    try:
+        member = await bot.get_chat_member(channel_id, user_id)
+        return member.status in ("member", "administrator", "creator")
+    except Exception:
+        return False
+
+
+async def get_subscription_keyboard(user_id: int, bot: Bot):
+    kb = InlineKeyboardBuilder()
+
+    if not CHANNELS:  # если нет каналов, возвращаем пустую клавиатуру
+        return None
+
+    # Добавляем только те каналы, на которые пользователь НЕ подписан
+    for ch in CHANNELS:
+        if not await check_subscription(user_id, bot, ch["id"]):
+            kb.button(text=ch["title"], url=ch["link"])
+
+    if kb.buttons:
+        kb.button(text="✅ Проверить подписку", callback_data="subs:check")
+
+    kb.adjust(1)
+    return kb.as_markup()
+
+
+
+
+async def ensure_subscribed(
+    message: Message | CallbackQuery,
+    state: FSMContext,
+    target: Optional[Tuple[int, int]] = None
+) -> bool:
+    """Проверка подписки на все каналы. Если не подписан — выводит клавиатуру подписки."""
+    
+    # 🔹 Если список каналов пустой → подписка не требуется
+    if not CHANNELS:
+        return True
+
+    bot = message.bot if isinstance(message, Message) else message.message.bot
+    user_id = message.from_user.id
+
+    # Проверяем все каналы
+    unsubscribed = [
+        ch for ch in CHANNELS if not await check_subscription(user_id, bot, ch["id"])
+    ]
+
+    if not unsubscribed:  # если всё ок
+        return True
+
+    # Сохраняем цель (если deep-link в скрипт)
+    if target:
+        await state.update_data(pending_target={"cat": target[0], "script": target[1]})
+
+    text = t(user_id, "sub_check_title")
+
+    if isinstance(message, Message):
+        await message.answer_photo(
+            photo=IMAGES["subscription"],
+            caption=text,
+            reply_markup=await get_subscription_keyboard(user_id, bot)
+        )
+    else:
+        await message.message.answer_photo(
+            photo=IMAGES["subscription"],
+            caption=text,
+            reply_markup=await get_subscription_keyboard(user_id, bot)
+        )
+
+    return False
+
+
+
+# ========================= FSM для админки и поиска =========================
+class SendStates(StatesGroup):
+    waiting_message = State()
+
+class EditMode(StatesGroup):
+    choose_entity = State()
+
+class EditCategories(StatesGroup):
+    choose_action = State()
+    waiting_new_name = State()
+    confirm_delete = State()
+
+class EditScripts(StatesGroup):
+    choose_action = State()
+    choose_cat = State()
+    waiting_script_name = State()
+    waiting_script_desc = State()
+    choose_cat_delete = State()
+    choose_script_delete = State()
+    confirm_delete = State()
+
+class SearchFSM(StatesGroup):
+    choose_mode = State()
+    waiting_query = State()
+    showing_results = State()
+
+class BypassFSM(StatesGroup):
+    waiting_url = State()
+
+def bypass_back_kb(user_id: int):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=t(user_id, "back"), callback_data="menu:root")  # назад в главное меню
+    return kb.as_markup()
+
+# ========================= ВРЕМЕННЫЕ КЕШИ (в памяти) =========================
+SEARCH_CACHE: Dict[int, dict] = {}  # user_id -> {"results": [...], "index": 0, "query": "...", "mode": "free/paid/any"}
+LAST_SWIPE_AT: Dict[int, datetime] = {}  # антиспам по пользователю
+
+# ========================= ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ API =========================
+
+
+SCRIPTBLOX_BASE = "https://scriptblox.com"
+
+from datetime import datetime, timedelta
+
+
+# ----- КЭШ -----
+API_CACHE: Dict[str, dict] = {}  # ключ -> {"data": ..., "expires": datetime}
+CACHE_TTL = timedelta(minutes=25)
+
+
+def make_cache_key(q: str, mode: str, page: int, max_items: int) -> str:
+    return f"{q.lower()}|{mode}|{page}|{max_items}"
+
+
+def get_from_cache(key: str) -> Optional[list]:
+    entry = API_CACHE.get(key)
+    if not entry:
+        return None
+    if datetime.now() > entry["expires"]:
+        API_CACHE.pop(key, None)  # удалить просроченный
+        return None
+    return entry["data"]
+
+
+def save_to_cache(key: str, data: list):
+    API_CACHE[key] = {
+        "data": data,
+        "expires": datetime.now() + CACHE_TTL
+    }
+
+
+# ----- API ScriptBlox -----
+async def api_search(q: str, mode: str, page: int = 1, max_items: int = 20) -> List[dict]:
+    """
+    Поиск скриптов с кэшем (25 минут).
+    """
+    key = make_cache_key(q, mode, page, max_items)
+    cached = get_from_cache(key)
+    if cached is not None:
+        return cached
+
+    params = {
+        "q": q,
+        "page": page,
+        "max": max_items,
+        "strict": "true",
+        "order": "desc",
+    }
+    if mode in ("free", "paid"):
+        params["mode"] = mode
+
+    url = f"{SCRIPTBLOX_BASE}/api/script/search"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, params=params, timeout=20) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            scripts = data.get("result", {}).get("scripts", [])
+            save_to_cache(key, scripts)
+            return scripts
+
+async def api_trending() -> List[dict]:
+    """
+    Тренды ScriptBlox с кэшем (25 минут).
+    """
+    key = "trending"
+    cached = get_from_cache(key)
+    if cached is not None:
+        return cached
+
+    url = f"{SCRIPTBLOX_BASE}/api/script/trending"
+    async with aiohttp.ClientSession() as session:
+        async with session.get(url, timeout=20) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            res = data.get("result") or data
+            if isinstance(res, dict):
+                items = res.get("scripts", [])
+            else:
+                items = res
+            items = items[:10]
+            save_to_cache(key, items)
+            return items
+
+
+
+
+
+def safe_code(text: str) -> str:
+    """Экранирует код для HTML <code>...</code>."""
+    return html.escape(text or "", quote=False)
+
+def bool_emoji(v: Optional[bool]) -> str:
+    return "✅" if v else "❌"
+
+def format_script_caption(item: dict) -> str:
+    # Извлекаем поля с защитой от отсутствия
+    title = item.get("title") or item.get("name") or "Без названия"
+    game = item.get("game", {}) or {}
+    game_name = game.get("name") or item.get("gameName") or "—"
+    verified = item.get("verified")
+    key_required = item.get("key")
+    views = item.get("views") or 0
+    likes = item.get("likeCount") or item.get("likes") or 0
+    created_at = item.get("createdAt") or item.get("created") or ""
+    publisher = (item.get("owner") or {}).get("username") if isinstance(item.get("owner"), dict) else (item.get("owner") or "—")
+    script_code = item.get("script") or ""
+
+    caption = (
+        f"<b>{html.escape(title)}</b>\n"
+        f"🎮 Игра: <b>{html.escape(game_name)}</b>\n"
+        f"☑️ Verified: {bool_emoji(bool(verified))}\n"
+        f"🔑 Key System: {bool_emoji(bool(key_required))}\n"
+        f"👀 Просмотры: <b>{views}</b>\n"
+        f"👍 Лайки: <b>{likes}</b>\n"
+        f"📅 Дата: {html.escape(str(created_at))}\n"
+        f"👤 Автор: {html.escape(str(publisher))}\n\n"
+    )
+    if script_code:
+        caption += f"<b>Скрипт:</b>\n<code>{safe_code(script_code)}</code>"
+    else:
+        caption += "<i>Код скрипта отсутствует.</i>"
+    return caption
+
+def extract_image_url(item: dict) -> Optional[str]:
+    # Пробуем взять картинку скрипта, затем игры
+    img = item.get("image") or item.get("thumbnail") or None
+    if not img:
+        game = item.get("game", {}) or {}
+        img = game.get("imageUrl") or game.get("thumbnail")
+    return img
+
+def search_menu_kb(user_id: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=RU["search_btn_new"], callback_data="search:new")
+    kb.button(text=RU["search_btn_trends"], callback_data="search:trends")
+    kb.button(text=RU["search_back"], callback_data="menu:root")
+    kb.adjust(1)
+    return kb.as_markup()
+
+def search_mode_kb() -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    kb.button(text=RU["search_mode_any"], callback_data="search:mode:any")
+    kb.button(text=RU["search_mode_free"], callback_data="search:mode:free")
+    kb.button(text=RU["search_mode_paid"], callback_data="search:mode:paid")
+    kb.button(text=RU["search_back"], callback_data="search:menu")
+    kb.adjust(2, 1)
+    return kb.as_markup()
+
+def search_nav_kb(index: int, total: int) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    # Кнопки навигации карточек
+    kb.button(text="⏮", callback_data="search:first")
+    kb.button(text="⬅️", callback_data="search:prev")
+    kb.button(text=f"{index+1}/{total}", callback_data="noop")
+    kb.button(text="➡️", callback_data="search:next")
+    kb.button(text="⏭", callback_data="search:last")
+    kb.button(text=RU["search_back"], callback_data="search:menu")
+    kb.adjust(5, 1)
+    return kb.as_markup()
+
+def trends_page_kb(items: List[dict], page: int, per_page: int = 5) -> InlineKeyboardMarkup:
+    kb = InlineKeyboardBuilder()
+    start = page * per_page
+    end = min(start + per_page, len(items))
+    for i in range(start, end):
+        it = items[i]
+        title = it.get("title") or it.get("name") or f"Script {i+1}"
+        kb.button(text=f"{title}", callback_data=f"trend:open:{i}")
+    # пагинация
+    pages = (len(items) + per_page - 1) // per_page
+    # стрелки
+    if pages > 1:
+        nav_row = []
+        if page > 0:
+            kb.button(text="⬅️ Пред.", callback_data=f"trend:page:{page-1}")
+        if page < pages - 1:
+            kb.button(text="След. ➡️", callback_data=f"trend:page:{page+1}")
+    kb.button(text=RU["trends_back"], callback_data="search:menu")
+    kb.adjust(1)
+    return kb.as_markup()
+
+# ========================= БОТ =========================
+bot = Bot(
+    token=TOKEN,
+    default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+)
+dp = Dispatcher()
+
+# ========================= Chache =========================
+
+@dp.message(Command("cacheinfo"))
+async def cmd_cache_info(m: Message):
+
+    if m.from_user.id not in ADMIN_IDS:
+        await m.answer("⛔ У тебя нет доступа к этой команде.")
+        return
+
+    now = datetime.now()
+    total = len(API_CACHE)
+    expired = sum(1 for v in API_CACHE.values() if now > v["expires"])
+    active = total - expired
+
+    text = (
+        "<b>📦 Кэш ScriptBlox</b>\n"
+        f"Всего записей: <b>{total}</b>\n"
+        f"Активные: <b>{active}</b>\n"
+        f"Просроченные: <b>{expired}</b>"
+    )
+    await m.answer(text, parse_mode=ParseMode.HTML)
+
+
+# --------------- старт / start с deep-link -----------------
+@dp.message(CommandStart())
+async def cmd_start(m: Message, state: FSMContext):
+    # авто-регистрация пользователя
+    if not get_user(m.from_user.id):
+        add_user(m.from_user.id, DEFAULT_LANG)
+
+    target: Optional[Tuple[int, int]] = None
+    if m.text and len(m.text.split()) > 1:
+        arg = m.text.split(maxsplit=1)[1]
+        if arg.startswith("idc") and "ids" in arg:
+            try:
+                a = arg.replace("idc", "").split("ids")
+                target = (int(a[0]), int(a[1]))
+            except Exception:
+                target = None
+
+    if not await ensure_subscribed(m, state, target):
+        return
+
+    if target:
+        await open_script_card(m.from_user.id, m, target[0], target[1])
+    else:
+        await show_main_menu(m.from_user.id, m)
+
+# --------------- Menu Start -----------------
+async def show_main_menu(user_id: int, where: Message | CallbackQuery):
+    user = get_user(user_id)
+    lang = user["lang"] if user else DEFAULT_LANG
+    L = LOCALES.get(lang, RU)
+
+    text = f"<b>{L['welcome_title']}</b>\n\n" + RU["subscription_required"]
+
+    if isinstance(where, Message):
+        await where.answer_photo(
+            photo=IMAGES["menu"],
+            caption=text,
+            reply_markup=menu_keyboard(user_id),
+            parse_mode=ParseMode.HTML
+        )
+    else:
+        try:
+            await where.message.edit_media(
+                media=InputMediaPhoto(
+                    media=IMAGES["menu"],
+                    caption=text,
+                    parse_mode=ParseMode.HTML
+                ),
+                reply_markup=menu_keyboard(user_id)
+            )
+        except Exception:
+            await where.message.delete()
+            await where.message.answer_photo(
+                photo=IMAGES["menu"],
+                caption=text,
+                reply_markup=menu_keyboard(user_id),
+                parse_mode=ParseMode.HTML
+            )
+# --------------- Кнопки подписки -----------------
+@dp.callback_query(F.data == "subs:check")
+async def cb_subs_check(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        await c.answer("Ещё не подписаны.", show_alert=False)
+        return
+    await c.answer(t(c.from_user.id, "sub_ok"), show_alert=False)
+    data = await state.get_data()
+    pending = data.get("pending_target")
+    if pending:
+        await open_script_card(c.from_user.id, c, pending["cat"], pending["script"])  # type: ignore
+        await state.update_data(pending_target=None)
+    else:
+        await show_main_menu(c.from_user.id, c)
+
+@dp.callback_query(F.data == "subs:skip")
+async def cb_subs_skip(c: CallbackQuery, state: FSMContext):
+    if not DEBUG_SKIP_SUBS:
+        await c.answer("Debug off")
+        return
+    data = await state.get_data()
+    pending = data.get("pending_target")
+    if pending:
+        await open_script_card(c.from_user.id, c, pending["cat"], pending["script"])  # type: ignore
+        await state.update_data(pending_target=None)
+    else:
+        await show_main_menu(c.from_user.id, c)
+
+# --------------- Меню -----------------
+@dp.message(Command("menu"))
+async def cmd_menu(m: Message, state: FSMContext):
+    if not await ensure_subscribed(m, state):
+        return
+    await show_main_menu(m.from_user.id, m)
+
+@dp.callback_query(F.data == "menu:root")
+async def cb_menu_root(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    await show_main_menu(c.from_user.id, c)
+
+@dp.callback_query(F.data == "menu:settings")
+async def cb_settings(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+
+    kb = InlineKeyboardBuilder()
+    kb.button(text=RU["lang_ru"], callback_data="lang:ru")
+    kb.button(text=RU["lang_en"], callback_data="lang:en")
+    kb.button(text=t(c.from_user.id, "back"), callback_data="menu:root")
+    kb.adjust(1)
+
+    caption = t(c.from_user.id, "change_lang")
+
+    try:
+        # если сообщение было фото → заменяем фото и подпись
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["settings"],  # картинка для меню настроек
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=kb.as_markup()
+        )
+    except Exception:
+        # если сообщение было текстом → удаляем и шлём новое фото
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["settings"],
+            caption=caption,
+            reply_markup=kb.as_markup(),
+            parse_mode="HTML"
+        )
+
+@dp.callback_query(F.data.startswith("lang:"))
+async def cb_set_lang(c: CallbackQuery):
+    lang = c.data.split(":", 1)[1]
+    if lang in LOCALES:
+        update_user_lang(c.from_user.id, lang)
+    await show_main_menu(c.from_user.id, c)
+
+# --------------- Каталог -----------------
+# === Каталог ===
+@dp.message(Command("catalog"))
+async def cmd_catalog(m: Message, state: FSMContext):
+    if not await ensure_subscribed(m, state):
+        return
+    cats = get_categories()   # из db.py
+    await m.answer(
+        t(m.from_user.id, "choose_category"),
+        reply_markup=categories_keyboard(m.from_user.id, cats)
+    )
+
+
+@dp.callback_query(F.data == "menu:catalog")
+async def cb_catalog(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    cats = get_categories()
+
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["catalog"],
+                caption=t(c.from_user.id, "choose_category")
+            ),
+            reply_markup=categories_keyboard(c.from_user.id, cats)
+        )
+    except Exception:
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["catalog"],
+            caption=t(c.from_user.id, "choose_category"),
+            reply_markup=categories_keyboard(c.from_user.id, cats)
+        )
+
+
+@dp.callback_query(F.data == "catalog:root")
+async def cb_catalog_root(c: CallbackQuery, state: FSMContext):
+    return await cb_catalog(c, state)
+
+
+@dp.callback_query(F.data.startswith("cat:"))
+async def cb_open_cat(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    cat_id = int(c.data.split(":")[1])
+    cat = find_category(cat_id)   # теперь берём категорию из базы
+    if not cat:
+        await c.answer("Категория не найдена", show_alert=True)
+        return
+
+    scripts = get_scripts(cat_id)  # скрипты из базы
+    caption = t(c.from_user.id, "scripts_in_cat", name=cat["name"])
+
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["scripts"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=scripts_keyboard(c.from_user.id, cat, scripts)
+        )
+    except Exception:
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["scripts"],
+            caption=caption,
+            reply_markup=scripts_keyboard(c.from_user.id, cat, scripts),
+            parse_mode="HTML"
+        )
+
+
+# ==== min
+
+
+# === Открыть карточку скрипта ===
+async def open_script_card(user_id: int, where: Message | CallbackQuery, cat_id: int, script_id: int):
+    cat = find_category(cat_id)   # категория из базы
+    if not cat:
+        if isinstance(where, Message):
+            await where.answer("Категория не найдена")
+        else:
+            await where.message.answer("Категория не найдена")
+        return
+
+    s = find_script(cat_id, script_id)   # скрипт из базы
+    if not s:
+        if isinstance(where, Message):
+            await where.answer("Скрипт не найден")
+        else:
+            await where.message.answer("Скрипт не найден")
+        return
+
+    text = f"<b>{s['name']}</b>\n\n{s['description']}"
+
+    try:
+        # если сообщение было фото → обновляем через edit_media
+        await where.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["scripts"],
+                caption=text,
+                parse_mode="HTML"
+            ),
+            reply_markup=script_card_kb(user_id, cat_id, script_id)
+        )
+    except Exception:
+        # если старое сообщение было текстом → удаляем и шлём новое с фото
+        if isinstance(where, Message):
+            await where.answer_photo(
+                photo=IMAGES["scripts"],
+                caption=text,
+                reply_markup=script_card_kb(user_id, cat_id, script_id),
+                parse_mode="HTML"
+            )
+        else:
+            await where.message.delete()
+            await where.message.answer_photo(
+                photo=IMAGES["scripts"],
+                caption=text,
+                reply_markup=script_card_kb(user_id, cat_id, script_id),
+                parse_mode="HTML"
+            )
+
+
+# === Обработчик кнопок "script:cat_id:script_id" ===
+@dp.callback_query(F.data.startswith("script:"))
+async def cb_open_script(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    _, cat_id, script_id = c.data.split(":")
+    await open_script_card(c.from_user.id, c, int(cat_id), int(script_id))
+
+# --------------- АДМИН: статистика -----------------
+@dp.message(Command("statsu"))
+async def cmd_stats(m: Message):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+
+    users = get_all_users()  # <-- теперь из базы
+    total = len(users)
+    now = datetime.now(timezone.utc)
+    today = 0
+    week = 0
+
+    for u in users:
+        joined = datetime.fromisoformat(u["joined"])
+        if joined.date() == now.date():
+            today += 1
+        if joined >= now - timedelta(days=7):
+            week += 1
+
+    text = (
+        f"<b>{RU['stats_title']}</b>\n"
+        f"{RU['stats_total'].format(n=total)}\n"
+        f"{RU['stats_today'].format(n=today)}\n"
+        f"{RU['stats_week'].format(n=week)}"
+    )
+    await m.answer(text)
+
+# --------------- АДМИН: рассылка -----------------
+@dp.message(Command("send"))
+async def cmd_send(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(SendStates.waiting_message)
+    await m.answer("Отправьте текст/фото/видео/сообщение для рассылки. /cancel — отмена")
+
+@dp.message(SendStates.waiting_message)
+async def do_broadcast(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    user_ids = get_all_user_ids()
+    sent = 0
+    for uid in user_ids:
+        try:
+            await m.copy_to(chat_id=uid)
+            sent += 1
+            await asyncio.sleep(0.05)  # задержка чтобы не словить flood
+        except Exception:
+            pass
+    await state.clear()
+    await m.answer(f"Рассылка завершена. Доставлено: {sent}")
+
+# --------------- АДМИН: /editcatalog -----------------
+@dp.message(Command("editcatalog"))
+async def cmd_edit(m: Message, state: FSMContext):
+    if m.from_user.id not in ADMIN_IDS:
+        return
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗂 Категории", callback_data="ed:categories")
+    kb.button(text="📃 Скрипты", callback_data="ed:scripts")
+    kb.button(text="❌ Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await m.answer("Что редактировать?", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data == "ed:cancel")
+async def ed_cancel(c: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await show_main_menu(c.from_user.id, c)
+
+
+# --- категории
+@dp.callback_query(F.data == "ed:categories")
+async def ed_categories(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(EditCategories.choose_action)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="🗂 Добавить категорию", callback_data="edc:add")
+    kb.button(text="✂️ Удалить категорию", callback_data="edc:del")
+    kb.button(text="❌ Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("Выберите действие:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditCategories.choose_action, F.data == "edc:add")
+async def edc_add(c: CallbackQuery, state: FSMContext):
+    await state.set_state(EditCategories.waiting_new_name)
+    await c.message.edit_text("🖋 Напишите название новой категории (до 20 символов):")
+
+
+@dp.message(EditCategories.waiting_new_name)
+async def edc_add_name(m: Message, state: FSMContext):
+    name = (m.text or "").strip()[:30]
+    add_category(name)
+    await state.clear()
+    await m.answer(RU["category_added"])
+
+
+@dp.callback_query(EditCategories.choose_action, F.data == "edc:del")
+async def edc_del(c: CallbackQuery, state: FSMContext):
+    cats = get_categories()
+    kb = InlineKeyboardBuilder()
+    for cat in cats:
+        kb.button(text=f"{cat['name']} (id {cat['id']})", callback_data=f"edc:choose:{cat['id']}")
+    kb.button(text="Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("Выберите категорию для удаления:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(F.data.startswith("edc:choose:"))
+async def edc_del_confirm(c: CallbackQuery, state: FSMContext):
+    cat_id = int(c.data.split(":")[-1])
+    cats = get_categories()
+    cat = next((x for x in cats if x["id"] == cat_id), None)
+    if not cat:
+        await c.answer("Не найдено", show_alert=True)
+        return
+    await state.set_state(EditCategories.confirm_delete)
+    await state.update_data(del_cat=cat_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да", callback_data="edc:yes")
+    kb.button(text="❌ Нет", callback_data="ed:categories")
+    kb.adjust(2)
+    await c.message.edit_text(RU["are_you_sure_delete_cat"].format(name=cat["name"]), reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditCategories.confirm_delete, F.data == "edc:yes")
+async def edc_del_yes(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    cat_id = int(data.get("del_cat"))
+    delete_category(cat_id)
+    await state.clear()
+    await c.message.edit_text(RU["deleted"])
+
+
+# --- скрипты
+@dp.callback_query(F.data == "ed:scripts")
+async def ed_scripts(c: CallbackQuery, state: FSMContext):
+    if c.from_user.id not in ADMIN_IDS:
+        return
+    await state.set_state(EditScripts.choose_action)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📃 Добавить Скрипт", callback_data="eds:add")
+    kb.button(text="🗑 Удалить Скрипт", callback_data="eds:del")
+    kb.button(text="❌ Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("Выберите действие:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditScripts.choose_action, F.data == "eds:add")
+async def eds_add_choose_cat(c: CallbackQuery, state: FSMContext):
+    await state.set_state(EditScripts.choose_cat)
+    cats = get_categories()
+    kb = InlineKeyboardBuilder()
+    for cat in cats:
+        kb.button(text=f"{cat['name']} (id {cat['id']})", callback_data=f"eds:add:cat:{cat['id']}")
+    kb.button(text="Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("В какую категорию добавить скрипт?", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditScripts.choose_cat, F.data.startswith("eds:add:cat:"))
+async def eds_add_got_cat(c: CallbackQuery, state: FSMContext):
+    cat_id = int(c.data.split(":")[-1])
+    await state.update_data(cat_id=cat_id)
+    await state.set_state(EditScripts.waiting_script_name)
+    await c.message.edit_text("🖋 Введите название скрипта:")
+
+
+@dp.message(EditScripts.waiting_script_name)
+async def eds_add_name(m: Message, state: FSMContext):
+    await state.update_data(script_name=(m.text or "").strip()[:50])
+    await state.set_state(EditScripts.waiting_script_desc)
+    await m.answer("🖋 Введите описание скрипта (HTML формат разрешён):")
+
+
+@dp.message(EditScripts.waiting_script_desc)
+async def eds_add_desc(m: Message, state: FSMContext):
+    data = await state.get_data()
+    add_script(
+        cat_id=int(data["cat_id"]),
+        name=data["script_name"],
+        description=m.html_text or m.text or ""
+    )
+    await state.clear()
+    await m.answer(RU["script_added"])
+
+
+
+
+@dp.callback_query(EditScripts.choose_action, F.data == "eds:del")
+async def eds_del_choose_cat(c: CallbackQuery, state: FSMContext):
+    await state.set_state(EditScripts.choose_cat_delete)
+    cats = get_categories()
+    kb = InlineKeyboardBuilder()
+    for cat in cats:
+        kb.button(text=f"{cat['name']} (id {cat['id']})", callback_data=f"eds:del:cat:{cat['id']}")
+    kb.button(text="Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("Выберите категорию скрипта для удаления:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditScripts.choose_cat_delete, F.data.startswith("eds:del:cat:"))
+async def eds_del_choose_script(c: CallbackQuery, state: FSMContext):
+    cat_id = int(c.data.split(":")[-1])
+    await state.update_data(cat_id=cat_id)
+    scripts = get_scripts(cat_id)
+    if not scripts:
+        await c.answer("В этой категории нет скриптов", show_alert=True)
+        return
+    kb = InlineKeyboardBuilder()
+    for s in scripts:
+        kb.button(text=f"{s['name']} (id {s['id']})", callback_data=f"eds:del:scr:{s['id']}")
+    kb.button(text="Отмена", callback_data="ed:cancel")
+    kb.adjust(1)
+    await c.message.edit_text("Выберите скрипт для удаления:", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditScripts.choose_cat_delete, F.data.startswith("eds:del:scr:"))
+async def eds_del_confirm(c: CallbackQuery, state: FSMContext):
+    script_id = int(c.data.split(":")[-1])
+    await state.set_state(EditScripts.confirm_delete)
+    await state.update_data(del_script=script_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="✅ Да", callback_data="eds:yes")
+    kb.button(text="❌ Нет", callback_data="ed:scripts")
+    kb.adjust(2)
+    await c.message.edit_text("Удалить этот скрипт?", reply_markup=kb.as_markup())
+
+
+@dp.callback_query(EditScripts.confirm_delete, F.data == "eds:yes")
+async def eds_del_yes(c: CallbackQuery, state: FSMContext):
+    data = await state.get_data()
+    script_id = int(data["del_script"])
+    delete_script(script_id)
+    await state.clear()
+    await c.message.edit_text(RU["deleted"])
+
+# --------------- ПУНКТЫ МЕНЮ, НЕ РЕАЛИЗОВАННЫЕ -------------
+
+
+@dp.callback_query(F.data == "menu:services")
+async def not_implemented3(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    await c.answer("Данная функция в разработке.")
+
+
+
+@dp.callback_query(F.data == "menu:profile")
+async def not_implemented4(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+
+    u = get_user(c.from_user.id)
+    text = (
+        f"<b>Профиль</b>\n\n"
+        f"ID: <code>{c.from_user.id}</code>\n"
+        f"Язык: {u.get('lang', 'ru')}"
+    )
+    markup = back_kb(c.from_user.id, "menu:root")
+    photo_url = "https://i.postimg.cc/4Nq07Nxh/profile.png"
+
+    try:
+        if c.message.photo:  # если уже было фото → редактируем
+            await c.message.edit_media(
+                media=InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"),
+                reply_markup=markup
+            )
+        else:  # если раньше был текст → заменяем на фото
+            await c.message.edit_media(
+                media=InputMediaPhoto(media=photo_url, caption=text, parse_mode="HTML"),
+                reply_markup=markup
+            )
+    except Exception:
+        # если редактировать нельзя (например, было чисто текстовое сообщение без фото)
+        await c.message.answer_photo(photo=photo_url, caption=text, reply_markup=markup)
+
+
+# ============================ BYPASS + ВСЕ ЧТО С НИМ СВЯЗАНО ============================ 
+
+
+RATE_LIMIT = Semaphore(23)
+RESET_TIME = 10
+last_reset = time.time()
+
+@dp.callback_query(F.data == "menu:bypass")
+async def cb_bypass_start(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    await state.set_state(BypassFSM.waiting_url)
+
+    caption = "🔗 Вставьте ссылку для байпаса:"
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["bypass"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=bypass_back_kb(c.from_user.id)
+        )
+    except Exception:
+        await c.message.answer_photo(
+            photo=IMAGES["bypass"],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=bypass_back_kb(c.from_user.id)
+        )
+
+
+def detect_provider(url: str) -> str:
+    """Определяем провайдера по домену"""
+    domain = urlparse(url).netloc.lower()
+    domain = domain.replace("www.", "")
+    return re.sub(r"\.(com|ru|org|net|io|xyz|info|co)$", "", domain) or "Неизвестный провайдер"
+
+
+def bypass_result_kb(user_id: int, result: str):
+    kb = InlineKeyboardBuilder()
+    kb.button(text="📋 Скопировать", switch_inline_query=result)
+    for b in bypass_back_kb(user_id).inline_keyboard:
+        kb.row(*b)
+    return kb.as_markup()
+
+
+@dp.message(BypassFSM.waiting_url)
+async def cb_bypass_url(m: Message, state: FSMContext):
+    url = (m.text or "").strip()
+    if not url.startswith("http"):
+        await m.answer("❌ Это не похоже на ссылку. Попробуй снова.", reply_markup=bypass_back_kb(m.from_user.id))
+        return
+
+    provider = detect_provider(url)
+
+    msg = await m.answer_photo(
+        photo=IMAGES["loading"],
+        caption="⏳ Байпасс в процессе...",
+        reply_markup=bypass_back_kb(m.from_user.id)
+    )
+
+    api_url = f"https://api.bypass.vip/premium/bypass?url={url}"
+    headers = {"x-api-key": "71824f05-c5f0-4141-a610-1469e634cc71"}
+    start_time = time.perf_counter()
+    result_text = "❌ Ошибка при байпасе."
+
+    global last_reset
+    now = time.time()
+    if now - last_reset > RESET_TIME:
+        while RATE_LIMIT._value < 23:
+            RATE_LIMIT.release()
+        last_reset = now
+
+    try:
+        async with RATE_LIMIT:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(api_url, headers=headers, timeout=20) as resp:
+                    text = await resp.text()
+                    # 📡 Логирование убрано
+
+                    if 200 <= resp.status < 300:  # любые 2xx считаем успешными
+                        try:
+                            data = await resp.json()
+                            result_text = (
+                                data.get("destination")
+                                or data.get("result")
+                                or data.get("url")
+                                or f"⚠️ Неожиданный ответ API:\n\n{data}"
+                            )
+                        except Exception:
+                            # Если JSON не удалось распарсить, показываем чистый текст
+                            result_text = text.strip() or "⚠️ Пустой ответ API."
+                    else:
+                        result_text = f"❌ API вернул статус {resp.status}:\n\n{text}"
+
+    except Exception as e:
+        result_text = f"⚠️ Ошибка при запросе: {e}"
+
+    elapsed = round(time.perf_counter() - start_time - 0.3, 2)
+    if elapsed < 0:
+        elapsed = 0
+
+    try:
+        await msg.delete()
+    except Exception:
+        pass
+
+    caption = (
+        f"<b>[⚡ ВАША ССЫЛКА ЗАБАЙПАСЕНА ⚡]</b>\n"
+        f"🌐 Провайдер: <b>{provider}</b>\n"
+        f"⏱ Время байпаса: {elapsed} сек.\n\n"
+        "✅ <b>Результат:</b>\n\n"
+        f"<code>{result_text}</code>"
+    )
+
+    await m.answer_photo(
+        photo=IMAGES["bypassed"],
+        caption=caption,
+        parse_mode="HTML",
+        reply_markup=bypass_result_kb(m.from_user.id, result_text)
+    )
+
+    await state.clear()
+
+# ========================= ПОИСК СКРИПТОВ (ScriptBlox) =========================
+
+@dp.callback_query(F.data == "menu:search")
+async def cb_search_menu(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    await state.clear()
+
+    caption = RU["search_menu_title"]
+
+    try:
+        # если предыдущее сообщение было фото
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["search"],                                             
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=search_menu_kb(c.from_user.id)
+        )
+    except Exception:
+        # если предыдущее сообщение было текстовое
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["search"],
+            caption=caption,
+            reply_markup=search_menu_kb(c.from_user.id),
+            parse_mode="HTML"
+        )
+
+
+
+@dp.callback_query(F.data == "search:menu")
+async def cb_search_menu_back(c: CallbackQuery, state: FSMContext):
+    await cb_search_menu(c, state)
+
+# ---- Тренды ----
+@dp.callback_query(F.data == "search:trends")
+async def cb_trends(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+
+    caption_loading = RU["trends_title"] + "\n\nЗагружаю..."
+    try:
+        # Сообщение "Загружаю..." с картинкой loading
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["loading"],
+                caption=caption_loading,
+                parse_mode="HTML"
+            )
+        )
+    except Exception:
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["loading"],
+            caption=caption_loading,
+            parse_mode="HTML"
+        )
+
+    items = await get_trends_cached()
+    if not items:
+        caption_fail = "Не удалось загрузить тренды."
+        try:
+            await c.message.edit_media(
+                InputMediaPhoto(
+                    media=IMAGES["trends"],
+                    caption=caption_fail,
+                    parse_mode="HTML"
+                ),
+                reply_markup=search_menu_kb(c.from_user.id)
+            )
+        except Exception:
+            await c.message.delete()
+            await c.message.answer_photo(
+                photo=IMAGES["trends"],
+                caption=caption_fail,
+                parse_mode="HTML",
+                reply_markup=search_menu_kb(c.from_user.id)
+            )
+        return
+
+    # Сохраняем в кеш тренды для открытия карточек по индексу
+    SEARCH_CACHE[c.from_user.id] = {"trends": items}
+
+    caption_ready = RU["trends_title"]
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["trends"],
+                caption=caption_ready,
+                parse_mode="HTML"
+            ),
+            reply_markup=trends_page_kb(items, page=0)
+        )
+    except Exception:
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["trends"],
+            caption=caption_ready,
+            parse_mode="HTML",
+            reply_markup=trends_page_kb(items, page=0)
+        )
+
+
+@dp.callback_query(F.data.startswith("trend:page:"))
+async def cb_trends_page(c: CallbackQuery, state: FSMContext):
+    page = int(c.data.split(":")[-1])
+    items = (SEARCH_CACHE.get(c.from_user.id) or {}).get("trends", [])
+    if not items:
+        await c.answer("Тренды устарели, обновите.", show_alert=False)
+        return
+
+    caption = RU["trends_title"]
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["trends"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=trends_page_kb(items, page=page)
+        )
+    except Exception:
+        await c.message.delete()
+        await c.message.answer_photo(
+            photo=IMAGES["trends"],
+            caption=caption,
+            parse_mode="HTML",
+            reply_markup=trends_page_kb(items, page=page)
+        )
+
+# ---- Новый поиск ----
+# ---- Новый поиск ----
+@dp.callback_query(F.data == "search:new")
+async def cb_search_new(c: CallbackQuery, state: FSMContext):
+    if not await ensure_subscribed(c, state):
+        return
+    await state.set_state(SearchFSM.choose_mode)
+
+    caption = RU["search_enter_mode"]
+    try:
+        # пробуем заменить на картинку с текстом
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["search"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=search_mode_kb()
+        )
+    except Exception:
+        try:
+            # если было текстовое сообщение
+            await c.message.edit_text(caption, reply_markup=search_mode_kb())
+        except Exception:
+            # если совсем не получилось — удаляем и шлём новое
+            await c.message.delete()
+            await c.message.answer_photo(
+                photo=IMAGES["search"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=search_mode_kb()
+            )
+
+
+@dp.callback_query(SearchFSM.choose_mode, F.data.startswith("search:mode:"))
+async def cb_search_mode(c: CallbackQuery, state: FSMContext):
+    mode = c.data.split(":")[-1]  # any/free/paid
+    await state.update_data(mode=mode)
+    await state.set_state(SearchFSM.waiting_query)
+
+    caption = RU["search_enter_query"]
+    try:
+        await c.message.edit_media(
+            InputMediaPhoto(
+                media=IMAGES["search"],
+                caption=caption,
+                parse_mode="HTML"
+            ),
+            reply_markup=back_kb(c.from_user.id, "search:menu")
+        )
+    except Exception:
+        try:
+            await c.message.edit_text(caption, reply_markup=back_kb(c.from_user.id, "search:menu"))
+        except Exception:
+            await c.message.delete()
+            await c.message.answer_photo(
+                photo=IMAGES["search"],
+                caption=caption,
+                parse_mode="HTML",
+                reply_markup=back_kb(c.from_user.id, "search:menu")
+            )
+
+
+@dp.message(StateFilter(SearchFSM.waiting_query))
+async def cb_search_query(m: Message, state: FSMContext):
+    if not await ensure_subscribed(m, state):
+        return
+
+    data = await state.get_data()
+    mode = data.get("mode", "any")
+    q = (m.text or "").strip()
+    if not q:
+        await m.answer("Пустой запрос. Введите текст поиска.")
+        return
+
+    msg = await m.answer(RU["search_loading"])
+
+    results = await api_search(q, mode=mode, page=1, max_items=20)
+    if not results:
+        await msg.edit_text(RU["search_no_results"].format(q=q), reply_markup=search_menu_kb(m.from_user.id))
+        await state.clear()
+        return
+
+    SEARCH_CACHE[m.from_user.id] = {"results": results, "index": 0, "query": q, "mode": mode}
+    await state.set_state(SearchFSM.showing_results)
+
+    item = results[0]
+    caption = format_script_caption(item)
+    img = extract_image_url(item)
+
+    try:
+        await msg.delete()
+        if img and isinstance(img, str) and img.startswith("http"):
+            sent = await m.answer_photo(
+                photo=img,
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_nav_kb(0, len(results))
+            )
+            SEARCH_CACHE[m.from_user.id]["message_id"] = sent.message_id
+        else:
+            sent = await m.answer(
+                caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=search_nav_kb(0, len(results))
+            )
+            SEARCH_CACHE[m.from_user.id]["message_id"] = sent.message_id
+    except Exception:
+        await msg.edit_text(
+            caption,
+            parse_mode=ParseMode.HTML,
+            reply_markup=search_nav_kb(0, len(results))
+        )
+        SEARCH_CACHE[m.from_user.id]["message_id"] = msg.message_id
+
+
+
+
+
+def is_on_cooldown(user_id: int) -> int:
+    """Возвращает оставшиеся секунды кд, если есть, иначе 0."""
+    now = datetime.now(timezone.utc)
+    last = LAST_SWIPE_AT.get(user_id)
+    if last:
+        delta = now - last
+        remain = SWIPE_COOLDOWN - int(delta.total_seconds())
+        if remain > 0:
+            return remain
+    return 0
+
+def touch_cooldown(user_id: int):
+    LAST_SWIPE_AT[user_id] = datetime.now(timezone.utc)
+
+async def update_search_card(c: CallbackQuery, new_index: int):
+    cache = SEARCH_CACHE.get(c.from_user.id) or {}
+    results = cache.get("results", [])
+    if not results:
+        await c.answer("Результаты устарели. Запустите поиск заново.", show_alert=False)
+        return
+
+    new_index = max(0, min(new_index, len(results) - 1))
+    item = results[new_index]
+    caption = format_script_caption(item)
+    img = extract_image_url(item)
+
+    msg_id = cache.get("message_id")
+    chat_id = c.message.chat.id if c.message else None
+
+    if not msg_id or not chat_id:
+        await c.answer("Сообщение устарело, начните поиск заново.", show_alert=True)
+        return
+
+    try:
+        if img:
+            media = InputMediaPhoto(media=img, caption=caption, parse_mode=ParseMode.HTML)
+            await bot.edit_message_media(chat_id=chat_id, message_id=msg_id, media=media)
+        else:
+            # если картинки нет, меняем только текст
+            await bot.edit_message_caption(chat_id=chat_id, message_id=msg_id, caption=caption, parse_mode=ParseMode.HTML)
+        await bot.edit_message_reply_markup(chat_id=chat_id, message_id=msg_id, reply_markup=search_nav_kb(new_index, len(results)))
+    except Exception as e:
+        # не шлём новое сообщение — просто предупреждаем
+        await c.answer("Не удалось обновить карточку", show_alert=False)
+
+    cache["index"] = new_index
+    SEARCH_CACHE[c.from_user.id] = cache
+
+@dp.callback_query(SearchFSM.showing_results, F.data.in_({"search:first", "search:prev", "search:next", "search:last"}))
+async def cb_search_nav(c: CallbackQuery, state: FSMContext):
+    remain = is_on_cooldown(c.from_user.id)
+    if remain > 0:
+        await c.answer(RU["swipe_on_cooldown"].format(sec=remain), show_alert=False)
+        return
+
+    cache = SEARCH_CACHE.get(c.from_user.id) or {}
+    idx = int(cache.get("index", 0))
+    results = cache.get("results", [])
+    if not results:
+        await c.answer("Результаты устарели. Запустите поиск заново.", show_alert=False)
+        return
+
+    if c.data == "search:first":
+        new_idx = 0
+    elif c.data == "search:prev":
+        new_idx = max(0, idx - 1)
+    elif c.data == "search:next":
+        new_idx = min(len(results) - 1, idx + 1)
+    else:
+        new_idx = len(results) - 1
+
+    await update_search_card(c, new_idx)
+    touch_cooldown(c.from_user.id)
+    await c.answer()
+
+
+@dp.callback_query(F.data == "noop")
+async def cb_noop(c: CallbackQuery):
+    try:
+        await c.answer()
+    except Exception:
+        pass
+
+# --------------- RUN -----------------
+async def main():
+    print("Bot started as @" + BOT_USERNAME)
+    await set_commands(bot)
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
+
+
+
+
+if __name__ == "__main__":
+    from db import init_db
+
+    # Инициализация базы (создание таблиц, если их нет)
+    init_db()
+
+    try:
+        asyncio.run(main())
+    except (KeyboardInterrupt, SystemExit):
+        print("Bot stopped")
