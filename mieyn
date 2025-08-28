@@ -48,8 +48,8 @@ from aiogram.client.default import DefaultBotProperties
 
 
 
-TOKEN = "8412358762:AAFpsJV3RXCl1P10YghrKd7wznKk4alXTTA"
-ADMIN_IDS = {7700558902, 1154554868, 1190117295, 7701801337}
+TOKEN = 
+ADMIN_IDS = 
 BOT_USERNAME = "MagicRBX_bot"
 
 DATA_DIR = "data"
